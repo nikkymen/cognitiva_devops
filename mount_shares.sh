@@ -5,134 +5,104 @@ SHARES=(
     "storage:/mnt/user/share /share"
     "storage:/mnt/user/storage /storage"
 )
-
-MOUNT_OPTIONS="defaults,_netdev,noatime,nofail,timeo=100,retrans=1"
-IDLE_TIMEOUT=300 
+MOUNT_OPTIONS="nfs4 defaults,_netdev,noatime,nofail,x-systemd.automount,x-systemd.idle-timeout=300,timeo=600,retrans=2 0 0"
 # ------------------------------
 
+# Проверка прав суперпользователя
 if [ "$EUID" -ne 0 ]; then
   echo "[-] Ошибка: Этот скрипт должен быть запущен с правами root."
-  echo "Используйте: curl -sSL ... | sudo bash"
+  echo "Установка: curl -sSL ... | sudo bash"
+  echo "Удаление:  curl -sSL ... | sudo bash -s -- --remove"
   exit 1
 fi
 
-# === РЕЖИМ ОТКЛЮЧЕНИЯ (ВЫЗОВ С АРГУМЕНТОМ disable) ===
-if [[ "$1" == "disable" || "$1" == "--disable" ]]; then
-    echo "[*] Запущен режим отключения NFS шаров..."
+# Определяем режим работы (по умолчанию - установка)
+MODE="install"
+if [[ "$1" == "--remove" || "$1" == "remove" ]]; then
+    MODE="remove"
+fi
+
+FSTAB_CHANGED=false
+
+# --- РЕЖИМ УДАЛЕНИЯ ---
+if [ "$MODE" = "remove" ]; then
+    echo "[*] Запущен режим удаления настроенных NFS шаров..."
     
     for SHARE_INFO in "${SHARES[@]}"; do
         read -r REMOTE LOCAL <<< "$SHARE_INFO"
-        UNIT_NAME=$(systemd-escape --path "$LOCAL")
         
-        echo "[-] Отключение и удаление автомонтирования для $LOCAL..."
+        # 1. Ленивое размонтирование (чтобы не зависнуть из-за Stale Handle)
+        if mountpoint -q "$LOCAL"; then
+            echo "[*] Размонтирование $LOCAL..."
+            umount -lf "$LOCAL"
+        fi
         
-        # Останавливаем и деактивируем службы
-        systemctl disable --now "${UNIT_NAME}.automount" &>/dev/null
-        systemctl disable --now "${UNIT_NAME}.mount" &>/dev/null
+        # 2. Безопасное удаление строки из /etc/fstab через awk
+        # Проверяем, есть ли запись в файле
+        if grep -qF "$REMOTE $LOCAL" /etc/fstab; then
+            echo "[+] Удаление записи для $LOCAL из /etc/fstab"
+            # Оставляем только те строки, где $1 НЕ равен REMOTE или $2 НЕ равен LOCAL
+            awk -v r="$REMOTE" -v l="$LOCAL" '$1 != r || $2 != l' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+            FSTAB_CHANGED=true
+        fi
         
-        # «Лениво» размонтируем папку, если она была смонтирована
-        umount -lf "$LOCAL" &>/dev/null
-        
-        # Удаляем конфигурационные файлы юнитов
-        rm -f "/etc/systemd/system/${UNIT_NAME}.automount"
-        rm -f "/etc/systemd/system/${UNIT_NAME}.mount"
-        
-        # Удаляем пустую директорию точки монтирования
-        rmdir "$LOCAL" 2>/dev/null
+        # 3. Удаление папки, только если она пустая
+        if [ -d "$LOCAL" ]; then
+            echo "[*] Удаление директории $LOCAL (если она пуста)..."
+            rmdir "$LOCAL" 2>/dev/null || echo "[~] Папка $LOCAL не пуста или занята, оставляем как есть."
+        fi
     done
+
+# --- РЕЖИМ УСТАНОВКИ / ОБНОВЛЕНИЯ ---
+else
+    echo "[*] Запущен режим настройки NFS шаров..."
     
-    # Перезапускаем конфигурацию systemd, чтобы применить удаление
-    systemctl daemon-reload
-    echo "[+] Все настроенные шары успешно отключены и удалены с этого хоста!"
-    exit 0
+    for SHARE_INFO in "${SHARES[@]}"; do
+        read -r REMOTE LOCAL <<< "$SHARE_INFO"
+        
+        # 1. Создаем локальную директорию, если её нет
+        if [ ! -d "$LOCAL" ]; then
+            echo "[+] Создание директории: $LOCAL"
+            mkdir -p "$LOCAL"
+        fi
+        
+        FSTAB_LINE="$REMOTE $LOCAL $MOUNT_OPTIONS"
+        
+        # Проверяем, существует ли уже ТОЧНО ТАКАЯ ЖЕ строка
+        if grep -qF "$FSTAB_LINE" /etc/fstab; then
+            echo "[~] Конфигурация для $LOCAL уже актуальна."
+        else
+            # Если запись с такими путями была, но с другими опциями — удаляем старую версию
+            if grep -qF "$REMOTE $LOCAL" /etc/fstab; then
+                echo "[*] Обновление устаревших опций для $LOCAL"
+                awk -v r="$REMOTE" -v l="$LOCAL" '$1 != r || $2 != l' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+            else
+                echo "[+] Добавление новой записи для $LOCAL"
+            fi
+            
+            # Страховка от отсутствия переноса строки в конце fstab
+            if [ -n "$(tail -c1 /etc/fstab 2>/dev/null)" ]; then
+                echo "" >> /etc/fstab
+            fi
+            
+            # Добавляем новую чистую строку
+            echo "$FSTAB_LINE" >> /etc/fstab
+            FSTAB_CHANGED=true
+        fi
+    done
 fi
 
-
-# === РЕЖИМ УСТАНОВКИ / СИНХРОНИЗАЦИИ (ОБЫЧНЫЙ ВЫЗОВ) ===
-echo "[*] Начало синхронизации NFS шаров через systemd..."
-ACTIVE_UNITS=()
-
-for SHARE_INFO in "${SHARES[@]}"; do
-    read -r REMOTE LOCAL <<< "$SHARE_INFO"
-    UNIT_NAME=$(systemd-escape --path "$LOCAL")
-    ACTIVE_UNITS+=("$UNIT_NAME")
-
-    if [ ! -d "$LOCAL" ]; then
-        echo "[+] Создание директории: $LOCAL"
-        mkdir -p "$LOCAL"
-    fi
-
-    MOUNT_FILE="/etc/systemd/system/${UNIT_NAME}.mount"
-    AUTOMOUNT_FILE="/etc/systemd/system/${UNIT_NAME}.automount"
-    UNIT_CHANGED=false
-
-    MOUNT_CONTENT="[Unit]
-Description=NFS Mount for $LOCAL (Managed by GitOps script)
-After=network-online.target
-Wants=network-online.target
-
-[Mount]
-What=$REMOTE
-Where=$LOCAL
-Type=nfs4
-Options=$MOUNT_OPTIONS
-
-[Install]
-WantedBy=multi-user.target"
-
-    AUTOMOUNT_CONTENT="[Unit]
-Description=Automount for NFS $LOCAL (Managed by GitOps script)
-
-[Automount]
-Where=$LOCAL
-TimeoutIdleSec=$IDLE_TIMEOUT
-
-[Install]
-WantedBy=multi-user.target"
-
-    if [ ! -f "$MOUNT_FILE" ] || [ "$MOUNT_CONTENT" != "$(cat "$MOUNT_FILE")" ]; then
-        echo "[+] Обновление конфигурации монтирования: $MOUNT_FILE"
-        echo "$MOUNT_CONTENT" > "$MOUNT_FILE"
-        UNIT_CHANGED=true
-    fi
-
-    if [ ! -f "$AUTOMOUNT_FILE" ] || [ "$AUTOMOUNT_CONTENT" != "$(cat "$AUTOMOUNT_FILE")" ]; then
-        echo "[+] Обновление конфигурации автомонтирования: $AUTOMOUNT_FILE"
-        echo "$AUTOMOUNT_CONTENT" > "$AUTOMOUNT_FILE"
-        UNIT_CHANGED=true
-    fi
-
-    if [ "$UNIT_CHANGED" = true ] || ! systemctl is-enabled "${UNIT_NAME}.automount" &>/dev/null; then
-        echo "[*] Перезапуск службы автомонтирования для $LOCAL..."
-        systemctl daemon-reload
-        systemctl enable "${UNIT_NAME}.automount" &>/dev/null
-        systemctl restart "${UNIT_NAME}.automount"
+# --- ПРИМЕНЕНИЕ ИЗМЕНЕНИЙ ---
+if [ "$FSTAB_CHANGED" = true ]; then
+    echo "[*] Применение изменений в systemd..."
+    systemctl daemon-reload
+    if [ "$MODE" = "remove" ]; then
+        systemctl restart local-fs.target remote-fs.target
+        echo "[+] Все шары успешно удалены и размонтированы."
     else
-        echo "[~] Шара $LOCAL уже в актуальном состоянии."
+        systemctl restart local-fs.target remote-fs.target
+        echo "[+] Настройка успешно завершена. Новые параметры активны."
     fi
-done
-
-# Блок очистки устаревших конфигураций
-echo "[*] Проверка на наличие удаленных в репозитории шар..."
-for f in /etc/systemd/system/*.automount; do
-    [ -e "$f" ] || continue
-    if grep -q "Managed by GitOps script" "$f"; then
-        FILE_NAME=$(basename "$f" .automount)
-        
-        if [[ ! " ${ACTIVE_UNITS[@]} " =~ " ${FILE_NAME} " ]]; then
-            echo "[-] Удаление устаревшей конфигурации: $FILE_NAME..."
-            MOUNT_POINT=$(systemd-escape --path --unescape "$FILE_NAME")
-            
-            systemctl disable --now "${FILE_NAME}.automount" &>/dev/null
-            umount -lf "$MOUNT_POINT" &>/dev/null
-            
-            rm -f "/etc/systemd/system/${FILE_NAME}.automount"
-            rm -f "/etc/systemd/system/${FILE_NAME}.mount"
-            rmdir "$MOUNT_POINT" 2>/dev/null 
-            
-            systemctl daemon-reload
-        fi
-    fi
-done
-
-echo "[+] Синхронизация успешно завершена!"
+else
+    echo "[~] Изменений в конфигурации системы не потребовалось."
+fi
