@@ -2,8 +2,8 @@
 
 # --- КОНФИГУРАЦИЯ ШАР ---
 SHARES=(
-    "storage:/mnt/user/share /share"
-    "storage:/mnt/user/storage /storage"
+    "storage:/mnt/user/share /mnt/nas/share"
+    "storage:/mnt/user/storage /mnt/nas/storage"
 )
 MOUNT_OPTIONS="nfs4 defaults,_netdev,noatime,nofail,x-systemd.automount,x-systemd.idle-timeout=300,timeo=600,retrans=2 0 0"
 # ------------------------------
